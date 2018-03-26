@@ -42,8 +42,10 @@ typedef struct libx265Context {
     const x265_api *api;
 
     float crf;
+    int   forced_idr;
     char *preset;
     char *tune;
+    char *profile;
     char *x265_opts;
 } libx265Context;
 
@@ -66,8 +68,6 @@ static av_cold int libx265_encode_close(AVCodecContext *avctx)
 {
     libx265Context *ctx = avctx->priv_data;
 
-    av_frame_free(&avctx->coded_frame);
-
     ctx->api->param_free(ctx->params);
 
     if (ctx->encoder)
@@ -80,23 +80,9 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
 {
     libx265Context *ctx = avctx->priv_data;
 
-    ctx->api = x265_api_get(av_pix_fmt_desc_get(avctx->pix_fmt)->comp[0].depth_minus1 + 1);
+    ctx->api = x265_api_get(av_pix_fmt_desc_get(avctx->pix_fmt)->comp[0].depth);
     if (!ctx->api)
         ctx->api = x265_api_get(0);
-
-    if (avctx->strict_std_compliance > FF_COMPLIANCE_EXPERIMENTAL &&
-        !av_pix_fmt_desc_get(avctx->pix_fmt)->log2_chroma_w) {
-        av_log(avctx, AV_LOG_ERROR,
-               "4:2:2 and 4:4:4 support is not fully defined for HEVC yet. "
-               "Set -strict experimental to encode anyway.\n");
-        return AVERROR(ENOSYS);
-    }
-
-    avctx->coded_frame = av_frame_alloc();
-    if (!avctx->coded_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Could not allocate frame.\n");
-        return AVERROR(ENOMEM);
-    }
 
     ctx->params = ctx->api->param_alloc();
     if (!ctx->params) {
@@ -127,13 +113,13 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
     ctx->params->fpsDenom        = avctx->time_base.num * avctx->ticks_per_frame;
     ctx->params->sourceWidth     = avctx->width;
     ctx->params->sourceHeight    = avctx->height;
-    ctx->params->bEnablePsnr     = !!(avctx->flags & CODEC_FLAG_PSNR);
+    ctx->params->bEnablePsnr     = !!(avctx->flags & AV_CODEC_FLAG_PSNR);
 
-    if ((avctx->color_primaries <= AVCOL_PRI_BT2020 &&
+    if ((avctx->color_primaries <= AVCOL_PRI_SMPTE432 &&
          avctx->color_primaries != AVCOL_PRI_UNSPECIFIED) ||
-        (avctx->color_trc <= AVCOL_TRC_BT2020_12 &&
+        (avctx->color_trc <= AVCOL_TRC_ARIB_STD_B67 &&
          avctx->color_trc != AVCOL_TRC_UNSPECIFIED) ||
-        (avctx->colorspace <= AVCOL_SPC_BT2020_CL &&
+        (avctx->colorspace <= AVCOL_SPC_ICTCP &&
          avctx->colorspace != AVCOL_SPC_UNSPECIFIED)) {
 
         ctx->params->vui.bEnableVideoSignalTypePresentFlag  = 1;
@@ -162,15 +148,35 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
     switch (avctx->pix_fmt) {
     case AV_PIX_FMT_YUV420P:
     case AV_PIX_FMT_YUV420P10:
+    case AV_PIX_FMT_YUV420P12:
         ctx->params->internalCsp = X265_CSP_I420;
         break;
     case AV_PIX_FMT_YUV422P:
     case AV_PIX_FMT_YUV422P10:
+    case AV_PIX_FMT_YUV422P12:
         ctx->params->internalCsp = X265_CSP_I422;
         break;
+    case AV_PIX_FMT_GBRP:
+    case AV_PIX_FMT_GBRP10:
+    case AV_PIX_FMT_GBRP12:
+        ctx->params->vui.matrixCoeffs = AVCOL_SPC_RGB;
+        ctx->params->vui.bEnableVideoSignalTypePresentFlag  = 1;
+        ctx->params->vui.bEnableColorDescriptionPresentFlag = 1;
     case AV_PIX_FMT_YUV444P:
     case AV_PIX_FMT_YUV444P10:
+    case AV_PIX_FMT_YUV444P12:
         ctx->params->internalCsp = X265_CSP_I444;
+        break;
+    case AV_PIX_FMT_GRAY8:
+    case AV_PIX_FMT_GRAY10:
+    case AV_PIX_FMT_GRAY12:
+        if (ctx->api->api_build_number < 85) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "libx265 version is %d, must be at least 85 for gray encoding.\n",
+                   ctx->api->api_build_number);
+            return AVERROR_INVALIDDATA;
+        }
+        ctx->params->internalCsp = X265_CSP_I400;
         break;
     }
 
@@ -187,7 +193,7 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
         ctx->params->rc.rateControlMode = X265_RC_ABR;
     }
 
-    if (!(avctx->flags & CODEC_FLAG_GLOBAL_HEADER))
+    if (!(avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER))
         ctx->params->bRepeatHeaders = 1;
 
     if (ctx->x265_opts) {
@@ -215,6 +221,18 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
         }
     }
 
+    if (ctx->profile) {
+        if (ctx->api->param_apply_profile(ctx->params, ctx->profile) < 0) {
+            int i;
+            av_log(avctx, AV_LOG_ERROR, "Invalid or incompatible profile set: %s.\n", ctx->profile);
+            av_log(avctx, AV_LOG_INFO, "Possible profiles:");
+            for (i = 0; x265_profile_names[i]; i++)
+                av_log(avctx, AV_LOG_INFO, " %s", x265_profile_names[i]);
+            av_log(avctx, AV_LOG_INFO, "\n");
+            return AVERROR(EINVAL);
+        }
+    }
+
     ctx->encoder = ctx->api->encoder_open(ctx->params);
     if (!ctx->encoder) {
         av_log(avctx, AV_LOG_ERROR, "Cannot open libx265 encoder.\n");
@@ -222,7 +240,7 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     }
 
-    if (avctx->flags & CODEC_FLAG_GLOBAL_HEADER) {
+    if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
         x265_nal *nal;
         int nnal;
 
@@ -233,7 +251,7 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
             return AVERROR_INVALIDDATA;
         }
 
-        avctx->extradata = av_malloc(avctx->extradata_size + FF_INPUT_BUFFER_PADDING_SIZE);
+        avctx->extradata = av_malloc(avctx->extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!avctx->extradata) {
             av_log(avctx, AV_LOG_ERROR,
                    "Cannot allocate HEVC header of size %d.\n", avctx->extradata_size);
@@ -269,9 +287,10 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         }
 
         x265pic.pts      = pic->pts;
-        x265pic.bitDepth = av_pix_fmt_desc_get(avctx->pix_fmt)->comp[0].depth_minus1 + 1;
+        x265pic.bitDepth = av_pix_fmt_desc_get(avctx->pix_fmt)->comp[0].depth;
 
-        x265pic.sliceType = pic->pict_type == AV_PICTURE_TYPE_I ? X265_TYPE_I :
+        x265pic.sliceType = pic->pict_type == AV_PICTURE_TYPE_I ?
+                                              (ctx->forced_idr ? X265_TYPE_IDR : X265_TYPE_I) :
                             pic->pict_type == AV_PICTURE_TYPE_P ? X265_TYPE_P :
                             pic->pict_type == AV_PICTURE_TYPE_B ? X265_TYPE_B :
                             X265_TYPE_AUTO;
@@ -288,7 +307,7 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     for (i = 0; i < nnal; i++)
         payload += nal[i].sizeBytes;
 
-    ret = ff_alloc_packet(pkt, payload);
+    ret = ff_alloc_packet2(avctx, pkt, payload, payload);
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "Error getting output packet.\n");
         return ret;
@@ -306,6 +325,8 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     pkt->pts = x265pic_out.pts;
     pkt->dts = x265pic_out.dts;
 
+#if FF_API_CODED_FRAME
+FF_DISABLE_DEPRECATION_WARNINGS
     switch (x265pic_out.sliceType) {
     case X265_TYPE_IDR:
     case X265_TYPE_I:
@@ -318,6 +339,15 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         avctx->coded_frame->pict_type = AV_PICTURE_TYPE_B;
         break;
     }
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
+
+#if X265_BUILD >= 130
+    if (x265pic_out.sliceType == X265_TYPE_B)
+#else
+    if (x265pic_out.frameData.sliceType == 'b')
+#endif
+        pkt->flags |= AV_PKT_FLAG_DISPOSABLE;
 
     *got_packet = 1;
     return 0;
@@ -327,6 +357,22 @@ static const enum AVPixelFormat x265_csp_eight[] = {
     AV_PIX_FMT_YUV420P,
     AV_PIX_FMT_YUV422P,
     AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_GBRP,
+    AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_NONE
+};
+
+static const enum AVPixelFormat x265_csp_ten[] = {
+    AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_GBRP,
+    AV_PIX_FMT_YUV420P10,
+    AV_PIX_FMT_YUV422P10,
+    AV_PIX_FMT_YUV444P10,
+    AV_PIX_FMT_GBRP10,
+    AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_GRAY10,
     AV_PIX_FMT_NONE
 };
 
@@ -334,16 +380,27 @@ static const enum AVPixelFormat x265_csp_twelve[] = {
     AV_PIX_FMT_YUV420P,
     AV_PIX_FMT_YUV422P,
     AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_GBRP,
     AV_PIX_FMT_YUV420P10,
     AV_PIX_FMT_YUV422P10,
     AV_PIX_FMT_YUV444P10,
+    AV_PIX_FMT_GBRP10,
+    AV_PIX_FMT_YUV420P12,
+    AV_PIX_FMT_YUV422P12,
+    AV_PIX_FMT_YUV444P12,
+    AV_PIX_FMT_GBRP12,
+    AV_PIX_FMT_GRAY8,
+    AV_PIX_FMT_GRAY10,
+    AV_PIX_FMT_GRAY12,
     AV_PIX_FMT_NONE
 };
 
 static av_cold void libx265_encode_init_csp(AVCodec *codec)
 {
-    if (x265_api_get(10))
+    if (x265_api_get(12))
         codec->pix_fmts = x265_csp_twelve;
+    else if (x265_api_get(10))
+        codec->pix_fmts = x265_csp_ten;
     else if (x265_api_get(8))
         codec->pix_fmts = x265_csp_eight;
 }
@@ -352,8 +409,10 @@ static av_cold void libx265_encode_init_csp(AVCodec *codec)
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
     { "crf",         "set the x265 crf",                                                            OFFSET(crf),       AV_OPT_TYPE_FLOAT,  { .dbl = -1 }, -1, FLT_MAX, VE },
+    { "forced-idr",  "if forcing keyframes, force them as IDR frames",                              OFFSET(forced_idr),AV_OPT_TYPE_BOOL,   { .i64 =  0 },  0,       1, VE },
     { "preset",      "set the x265 preset",                                                         OFFSET(preset),    AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
     { "tune",        "set the x265 tune parameter",                                                 OFFSET(tune),      AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
+    { "profile",     "set the x265 profile",                                                        OFFSET(profile),   AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
     { "x265-params", "set the x265 configuration using a :-separated list of key=value parameters", OFFSET(x265_opts), AV_OPT_TYPE_STRING, { 0 }, 0, 0, VE },
     { NULL }
 };
@@ -382,5 +441,6 @@ AVCodec ff_libx265_encoder = {
     .priv_data_size   = sizeof(libx265Context),
     .priv_class       = &class,
     .defaults         = x265_defaults,
-    .capabilities     = CODEC_CAP_DELAY | CODEC_CAP_AUTO_THREADS,
+    .capabilities     = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_AUTO_THREADS,
+    .wrapper_name     = "libx265",
 };

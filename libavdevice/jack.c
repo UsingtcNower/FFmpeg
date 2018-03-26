@@ -94,13 +94,9 @@ static int process_callback(jack_nframes_t nframes, void *arg)
 
     /* Copy and interleave audio data from the JACK buffer into the packet */
     for (i = 0; i < self->nports; i++) {
-    #if HAVE_JACK_PORT_GET_LATENCY_RANGE
         jack_latency_range_t range;
         jack_port_get_latency_range(self->ports[i], JackCaptureLatency, &range);
         latency += range.max;
-    #else
-        latency += jack_port_get_total_latency(self->client, self->ports[i]);
-    #endif
         buffer = jack_port_get_buffer(self->ports[i], self->buffer_size);
         for (j = 0; j < self->buffer_size; j++)
             pkt_data[j * self->nports + i] = buffer[j];
@@ -154,8 +150,8 @@ static int start_jack(AVFormatContext *context)
     jack_status_t status;
     int i, test;
 
-    /* Register as a JACK client, using the context filename as client name. */
-    self->client = jack_client_open(context->filename, JackNullOption, &status);
+    /* Register as a JACK client, using the context url as client name. */
+    self->client = jack_client_open(context->url, JackNullOption, &status);
     if (!self->client) {
         av_log(context, AV_LOG_ERROR, "Unable to register as a JACK client\n");
         return AVERROR(EIO);
@@ -178,7 +174,7 @@ static int start_jack(AVFormatContext *context)
                                             JackPortIsInput, 0);
         if (!self->ports[i]) {
             av_log(context, AV_LOG_ERROR, "Unable to register port %s:%s\n",
-                   context->filename, str);
+                   context->url, str);
             jack_client_close(self->client);
             return AVERROR(EIO);
         }
@@ -200,6 +196,10 @@ static int start_jack(AVFormatContext *context)
     self->filled_pkts = av_fifo_alloc_array(FIFO_PACKETS_NUM, sizeof(AVPacket));
     /* New packets FIFO with one extra packet for safety against underruns */
     self->new_pkts    = av_fifo_alloc_array((FIFO_PACKETS_NUM + 1), sizeof(AVPacket));
+    if (!self->new_pkts) {
+        jack_client_close(self->client);
+        return AVERROR(ENOMEM);
+    }
     if ((test = supply_new_packets(self, context))) {
         jack_client_close(self->client);
         return test;
@@ -214,7 +214,7 @@ static void free_pkt_fifo(AVFifoBuffer **fifo)
     AVPacket pkt;
     while (av_fifo_size(*fifo)) {
         av_fifo_generic_read(*fifo, &pkt, sizeof(pkt), NULL);
-        av_free_packet(&pkt);
+        av_packet_unref(&pkt);
     }
     av_fifo_freep(fifo);
 }
@@ -248,14 +248,14 @@ static int audio_read_header(AVFormatContext *context)
         return AVERROR(ENOMEM);
     }
 
-    stream->codec->codec_type   = AVMEDIA_TYPE_AUDIO;
+    stream->codecpar->codec_type   = AVMEDIA_TYPE_AUDIO;
 #if HAVE_BIGENDIAN
-    stream->codec->codec_id     = AV_CODEC_ID_PCM_F32BE;
+    stream->codecpar->codec_id     = AV_CODEC_ID_PCM_F32BE;
 #else
-    stream->codec->codec_id     = AV_CODEC_ID_PCM_F32LE;
+    stream->codecpar->codec_id     = AV_CODEC_ID_PCM_F32LE;
 #endif
-    stream->codec->sample_rate  = self->sample_rate;
-    stream->codec->channels     = self->nports;
+    stream->codecpar->sample_rate  = self->sample_rate;
+    stream->codecpar->channels     = self->nports;
 
     avpriv_set_pts_info(stream, 64, 1, 1000000);  /* 64 bits pts in us */
     return 0;
